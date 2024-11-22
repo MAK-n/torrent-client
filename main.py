@@ -1,11 +1,32 @@
 import json
 import sys
+from textwrap import wrap
 import bencodepy
-
+import hashlib
+import requests
+import urllib.parse
+import socket
 
 def decode_bencode(bencoded_value):
     bc = bencodepy.Bencode()
     return bc.decode(bencoded_value)
+
+def encode_bencode(data):
+    bc = bencodepy.Bencode()
+    return bc.encode(data)
+
+def sha1(to_sha1):
+    return hashlib.sha1(to_sha1).hexdigest()
+
+def bytes_to_str(data):
+            if isinstance(data, dict):
+                return {bytes_to_str(k): bytes_to_str(v) for k, v in data.items()}
+            elif isinstance(data, list):
+                return [bytes_to_str(i) for i in data]
+            elif isinstance(data, bytes):
+                return data.decode(errors='replace')
+            else:
+                return data
 
 def main():
     command = sys.argv[1]
@@ -16,16 +37,7 @@ def main():
         # json.dumps() can't handle bytes, but bencoded "strings" need to be
         # bytestrings since they might contain non utf-8 characters.
         #
-        # Let's convert them to strings for printing to the console.
-        def bytes_to_str(data):
-            if isinstance(data, dict):
-                return {bytes_to_str(k): bytes_to_str(v) for k, v in data.items()}
-            elif isinstance(data, list):
-                return [bytes_to_str(i) for i in data]
-            elif isinstance(data, bytes):
-                return data.decode(errors='replace')
-            else:
-                return data
+
 
         # Decode the bencoded value and print it as JSON
         print(json.dumps(bytes_to_str(decode_bencode(bencoded_value))))
@@ -37,18 +49,94 @@ def main():
             bencoded_content = torrent_file.read()
 
         try:
-            # Check if the data starts with 'd' (dictionary) or 'l' (list)
             if not (bencoded_content.startswith(b'd') or bencoded_content.startswith(b'l')):
                 raise ValueError("Invalid bencoded data structure.")
 
             torrent = decode_bencode(bencoded_content)
+            info_bencoded= encode_bencode(torrent[b"info"])
+            info_sha1 = sha1(info_bencoded)
+
+            # Get the pieces list as 20-byte chunks
+            pieces = torrent[b"info"][b"pieces"]
+            pieces_list = [pieces[i:i+20] for i in range(0, len(pieces), 20)]
+            pieces_list_sha1 = [piece.hex() for piece in pieces_list]
+
             print("Tracker URL:", torrent[b"announce"].decode())
             print("Length:", torrent[b"info"][b"length"])
-            print("Name:", torrent[b"info"][b"name"])
+            print("Info Hash:", info_sha1)
+            print("Piece Length:", torrent[b"info"][b"piece length"])
+            print("Piece Hashes:")
+            for i in range(0,len(pieces_list_sha1)):
+                print(pieces_list[i])
+
         except Exception as e:
             print("Error decoding bencoded content:", e)
 
 
+    elif command == "peers":
+        file_name = sys.argv[2]
+        with open(file_name, "r+b") as torrent_file:
+            bencoded_content = torrent_file.read()
+
+        torrent = decode_bencode(bencoded_content)
+        info_bencoded = encode_bencode(torrent[b"info"])
+        info_hash = hashlib.sha1(info_bencoded).digest()
+
+        tracker_url = torrent[b"announce"].decode()
+        # print(f"Tracker URL: {tracker_url}")
+
+        info_hash_encoded = urllib.parse.quote(info_hash)  #  URL encode
+    
+
+        # print(f"Raw info_hash: {info_hash}") 
+        # print(f"URL-encoded info_hash: {info_hash}")
+        # print(f"left: {torrent[b"info"][b"length"]}")
+
+        params = {
+            "info_hash": info_hash,
+            "peer_id": "00112233445566778899",
+            "port": 6881,
+            "uploaded": 0,
+            "downloaded": 0,
+            "left": torrent[b"info"][b"length"],
+            "compact": 1
+        }
+
+        response = requests.get(tracker_url, params=params)
+        # print(response.content)
+        # print(f"response url: {response.url}")
+        response_dict= decode_bencode(response.content)
+        # print(response_dict)
+
+
+
+        peers = response_dict.get(b"peers",b"")
+        # print("peers: {peers}")
+
+        for i in range( 0 , len(peers) , 6 ):
+            ip=".".join(str(b) for b in peers[i:i+4])
+            portarray = peers[i+4:i+6]
+            port=  int.from_bytes(portarray)
+            print( f"{ip}:{port}" )
+    
+    elif command == "handshake":
+        peer_ip , peer_port = sys.argv[3].split(":")
+        file_name = sys.argv[2]
+        with open( file_name, "r+b" ) as torrent_file:
+            bencoded_content = torrent_file.read()
+
+        torrent = decode_bencode(bencoded_content)
+        info_bencoded = encode_bencode(torrent[b"info"])
+        info_hash = hashlib.sha1(info_bencoded).digest()
+
+        handshake = bytes([19])+b"BitTorrent protocol\x00\x00\x00\x00\x00\x00\x00\x00" + info_hash + b"00112233445566778899"
+
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.connect((peer_ip, int(peer_port)))
+        sock.send(handshake)
+        print(f"Peer ID: {sock.recv(68)[48:].hex()}")
+        sock.close()
+    
     else:
         raise NotImplementedError(f"Unknown command {command}")
 
